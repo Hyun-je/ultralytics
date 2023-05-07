@@ -387,7 +387,7 @@ class Exporter:
         import coremltools as ct  # noqa
 
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
-        f = self.file.with_suffix('.mlmodel')
+        f = self.file.with_suffix('.mlpackage')
 
         bias = [0.0, 0.0, 0.0]
         scale = 1 / 255
@@ -397,8 +397,10 @@ class Exporter:
             model = self.model
         elif self.model.task == 'detect':
             model = iOSDetectModel(self.model, self.im) if self.args.nms else self.model
+        elif self.model.task == 'segment':
+            model = iOSSegmentModel(self.model, self.im) if self.args.nms else self.model
         else:
-            # TODO CoreML Segment and Pose model pipelining
+            # TODO CoreML Pose model pipelining
             model = self.model
 
         ts = torch.jit.trace(model.eval(), self.im, strict=False)  # TorchScript model
@@ -410,8 +412,11 @@ class Exporter:
             if 'kmeans' in mode:
                 check_requirements('scikit-learn')  # scikit-learn package required for k-means quantization
             ct_model = ct.models.neural_network.quantization_utils.quantize_weights(ct_model, bits, mode)
-        if self.args.nms and self.model.task == 'detect':
-            ct_model = self._pipeline_coreml(ct_model)
+        if self.args.nms:
+            if self.model.task == 'detect':
+                ct_model = self._pipeline_coreml(ct_model)
+            elif self.model.task == 'segment':
+                ct_model = self._pipeline_coreml(ct_model)
 
         m = self.metadata  # metadata dict
         ct_model.short_description = m.pop('description')
@@ -832,6 +837,31 @@ class iOSDetectModel(torch.nn.Module):
     def forward(self, x):
         """Normalize predictions of object detection model with input size-dependent factors."""
         xywh, cls = self.model(x)[0].transpose(0, 1).split((4, self.nc), 1)
+        return cls, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
+    
+
+class iOSSegmentModel(torch.nn.Module):
+    """Wrap an Ultralytics YOLO model for iOS export."""
+
+    def __init__(self, model, im):
+        """Initialize the iOSSegmentModel class with a YOLO model and example image."""
+        super().__init__()
+        b, c, h, w = im.shape  # batch, channel, height, width
+        self.model = model
+        self.nc = len(model.names)  # number of classes
+        if w == h:
+            self.normalize = 1.0 / w  # scalar
+        else:
+            self.normalize = torch.tensor([1.0 / w, 1.0 / h, 1.0 / w, 1.0 / h])  # broadcast (slower, smaller)
+
+    def forward(self, x):
+        """Normalize predictions of object detection model with input size-dependent factors."""
+
+        prediction = self.model(x)[0]
+        proto = self.model(x)[1]
+        nm = proto.shape[1] # number of masks
+
+        xywh, cls, mask = prediction[0].transpose(0, 1).split((4, self.nc, nm), 1)
         return cls, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
 
 
