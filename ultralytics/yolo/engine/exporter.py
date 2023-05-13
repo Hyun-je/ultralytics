@@ -387,7 +387,7 @@ class Exporter:
         import coremltools as ct  # noqa
 
         LOGGER.info(f'\n{prefix} starting export with coremltools {ct.__version__}...')
-        f = self.file.with_suffix('.mlpackage')
+        f = self.file.with_suffix('.mlmodel')
 
         bias = [0.0, 0.0, 0.0]
         scale = 1 / 255
@@ -405,6 +405,7 @@ class Exporter:
 
         ts = torch.jit.trace(model.eval(), self.im, strict=False)  # TorchScript model
         ct_model = ct.convert(ts,
+                              convert_to="neuralnetwork",
                               inputs=[ct.ImageType('image', shape=self.im.shape, scale=scale, bias=bias)],
                               classifier_config=classifier_config)
         bits, mode = (8, 'kmeans_lut') if self.args.int8 else (16, 'linear') if self.args.half else (32, None)
@@ -415,8 +416,8 @@ class Exporter:
         if self.args.nms:
             if self.model.task == 'detect':
                 ct_model = self._pipeline_coreml(ct_model)
-            elif self.model.task == 'segment':
-                ct_model = self._pipeline_coreml(ct_model)
+            # elif self.model.task == 'segment':
+            #     ct_model = self._pipeline_coreml(ct_model)
 
         m = self.metadata  # metadata dict
         ct_model.short_description = m.pop('description')
@@ -838,6 +839,8 @@ class iOSDetectModel(torch.nn.Module):
         """Normalize predictions of object detection model with input size-dependent factors."""
         xywh, cls = self.model(x)[0].transpose(0, 1).split((4, self.nc), 1)
         return cls, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
+        # xywh.shape=torch.Size([8190, 4])
+        # cls.shape=torch.Size([8190, 80])
     
 
 class iOSSegmentModel(torch.nn.Module):
@@ -857,12 +860,40 @@ class iOSSegmentModel(torch.nn.Module):
     def forward(self, x):
         """Normalize predictions of object detection model with input size-dependent factors."""
 
-        prediction = self.model(x)[0]
-        proto = self.model(x)[1]
+        outputs = self.model(x)
+        prediction = outputs[0]
+        proto = outputs[1]
         nm = proto.shape[1] # number of masks
 
-        xywh, cls, mask = prediction[0].transpose(0, 1).split((4, self.nc, nm), 1)
-        return cls, xywh * self.normalize  # confidence (3780, 80), coordinates (3780, 4)
+        prediction = prediction.squeeze(0).permute(1, 0) # shape : batch:1, (bbox:4, classes:80, masks: 32), objects: 8190
+        proto = proto.squeeze(0) # shape : batch:1, protos: 32, height:input_height/4, width:input_width/4
+
+        boxes = prediction[:, :4]
+        boxes_xyxy = torch.empty_like(boxes)
+        boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # top left x
+        boxes_xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] / 2  # top left y
+        boxes_xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] / 2  # bottom right x
+        boxes_xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] / 2  # bottom right y
+
+        masks = prediction[:, -nm:]
+        class_prob = prediction[:, 4: 4+80]
+        max_prob = class_prob.amax(dim=1, keepdim=True)
+        max_prob_index = torch.argmax(class_prob, dim=1, keepdim=True)
+
+        top_values, top_indexes = torch.topk(max_prob, k=50, dim=0)
+        top_values = top_values.squeeze(1)
+        top_indexes = top_indexes.squeeze(1)
+
+        boxes_xyxy = boxes_xyxy[top_indexes]
+        masks = masks[top_indexes]
+        classes = max_prob_index[top_indexes]
+        scores = max_prob[top_indexes]
+
+        # import torchvision
+        # i = torchvision.ops.nms(boxes=boxes_xyxy.squeeze(), scores=scores.squeeze(), iou_threshold=0.7)
+        # i = torch.nn.functional.one_hot(i, num_classes=50)
+
+        return boxes_xyxy, classes, scores, masks
 
 
 def export(cfg=DEFAULT_CFG):
