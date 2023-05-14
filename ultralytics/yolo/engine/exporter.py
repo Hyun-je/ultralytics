@@ -868,6 +868,8 @@ class iOSSegmentModel(torch.nn.Module):
         prediction = prediction.squeeze(0).permute(1, 0) # shape : batch:1, (bbox:4, classes:80, masks: 32), objects: 8190
         proto = proto.squeeze(0) # shape : batch:1, protos: 32, height:input_height/4, width:input_width/4
 
+
+        # Classification
         boxes = prediction[:, :4]
         boxes_xyxy = torch.empty_like(boxes)
         boxes_xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] / 2  # top left x
@@ -889,11 +891,25 @@ class iOSSegmentModel(torch.nn.Module):
         classes = max_prob_index[top_indexes]
         scores = max_prob[top_indexes]
 
-        # import torchvision
-        # i = torchvision.ops.nms(boxes=boxes_xyxy.squeeze(), scores=scores.squeeze(), iou_threshold=0.7)
-        # i = torch.nn.functional.one_hot(i, num_classes=50)
 
-        return boxes_xyxy, classes, scores, masks
+        # Non maximum suppression
+        import torchvision
+        i = torchvision.ops.nms(boxes=boxes_xyxy.squeeze(), scores=scores.squeeze(), iou_threshold=0.7)
+        #i = torch.nn.functional.one_hot(i, num_classes=50)
+
+        boxes_xyxy = boxes_xyxy[i]
+        masks = masks[i]
+        classes = max_prob_index[i]
+        scores = max_prob[i]
+
+
+        # Process mask
+        c, mh, mw = proto.shape  # CHW
+        ih, iw = (480, 832)
+        masks_out = (masks @ proto.float().view(c, -1)).sigmoid().view(-1, mh, mw)  # CHW
+
+
+        return boxes_xyxy, classes, scores, masks_out
 
 
 def export(cfg=DEFAULT_CFG):
